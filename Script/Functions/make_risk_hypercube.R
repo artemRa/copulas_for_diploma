@@ -1,5 +1,5 @@
 make_risk_hypercube <-
-  function(raw_xtr, m) {
+  function(raw_xtr, m = 5, significant_size = 100) {
 
     # Вводные данные
     var_dim <- NCOL(raw_xtr) - 1
