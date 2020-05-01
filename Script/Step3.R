@@ -442,7 +442,6 @@ fact_risk <-
   
 
 plot(steps, fact_risk, type = 'l', col = 'red', ylim = c(0.1, 0.15))
-lines(steps, risk, type = 'l')
 
 
 
