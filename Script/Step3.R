@@ -6,6 +6,8 @@ library(scorecard)
 library(readr)
 library(lubridate)
 library(ggpubr)
+library(conflicted)
+library(gganimate)
 
 
 source("./Script/Functions/make_risk_hypercube.R")
@@ -332,7 +334,7 @@ flexy_family_params %>%
 
 # Грaфики c параметрами
 for (i in 1:3) {
-  
+
   flexy_family_params %>% 
     left_join(cop_dict, by = "fam") %>% 
     filter(cop == 1) %>%
@@ -444,4 +446,132 @@ fact_risk <-
 plot(steps, fact_risk, type = 'l', col = 'red', ylim = c(0.1, 0.15))
 
 
+# Конфликты функций
+conflict_prefer("filter", "dplyr", "base")
+conflict_prefer("filter", "dplyr", "stats")
+conflict_prefer("select", "dplyr", "MASS")
 
+
+
+hypercube_history_df <- 
+  hypercube_data_list %>% 
+  map(~ mutate(., risk = bads2 / cnt2) %>% select(c(risk_drivers, "risk", "group"))) %>% 
+  reduce(left_join, by = risk_drivers, suffix = c("", "2"))
+
+risk_var <-  tidyselect::vars_select(colnames(hypercube_history_df), starts_with("risk"))
+group_var <- tidyselect::vars_select(colnames(hypercube_history_df), starts_with("group"))
+
+risk_hisory_df <- hypercube_history_df %>% select(risk_drivers, risk_var)
+group_hisory_df <- hypercube_history_df %>% select(risk_drivers, group_var)
+
+colnames(risk_hisory_df)[-seq(length(risk_drivers))] <- names(num_mature)
+colnames(group_hisory_df)[-seq(length(risk_drivers))] <- names(num_mature)
+
+hypercube_history_df <-
+  inner_join(
+    risk_hisory_df %>% 
+      pivot_longer(
+        names_to = "date",
+        values_to = "risk",
+        -risk_drivers
+      ),
+    group_hisory_df %>% 
+    pivot_longer(
+      names_to = "date",
+      values_to = "group",
+      -risk_drivers
+    ),
+    by = c(risk_drivers, "date")
+  ) %>% 
+  mutate_if(is.character, as.Date)
+
+
+# Анимация
+test <- hypercube_history_df %>% 
+  mutate_if(is.character, as.Date) %>% 
+  ggplot() +
+  geom_raster(aes(x = int_rate, y = dti, fill = risk)) +
+  scale_fill_viridis_c(option = "plasma") +
+  # geom_label(aes(x = int_rate, y = dti, label = round(risk, 2)), alpha = 0.5, color = NA) + 
+  # geom_text(aes(x = int_rate, y = dti, label = round(risk, 2))) +
+  facet_grid(cols = vars(annual_inc), labeller = label_both) +
+  scale_color_manual(breaks = c(0, 1), values=c("black", "red")) +
+  transition_time(date) +
+  labs(title = "Date: {frame_time}")
+
+animate(test, width = 1600, height = 400, fps = 3)
+anim_save("./Output/lending_club_hypercube_anim.gif")
+
+
+
+hypercube_history_df %>% 
+  ggplot() +
+  geom_line(aes(x = date, y = risk, color = as.factor(int_rate)), show.legend = F) +
+  facet_grid(dti ~ annual_inc + int_rate, labeller = label_both) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank()
+  )
+
+ggsave("./Output/lendin_club_risk_hyper_dyn.png", width = 24, height = 5, dpi = 240)
+
+
+N2 <- 500
+risk_dots <- list()
+
+for (i in num_mature[-1]) {
+  
+  N <- (reverse_data_list %>% map_int(NROW))[i]
+  par_flow <- flexy_family_params %>% filter(id == i-1)
+  
+  U2 <- CDVineSim(N * N2, family = par_flow$fam, par = par_flow$par, par2 = par_flow$par2, type = 2)
+  reverse_data <- 
+    map(1:NCOL(U), ~ approxfun(U[,.x], X[,.x] %>% pull())(U2[,.x])) %>% 
+    as.data.frame()
+  colnames(reverse_data) <- risk_drivers
+  
+  risk_dots[[i]] <- 
+    split_it(reverse_data, breaks) %>% 
+    mutate(split_gr = rep(seq(N2), N)) %>% 
+    group_by(.dots = c(risk_drivers, "split_gr")) %>%
+    summarise(sim_cnt = n()) %>% 
+    ungroup() %>% 
+    left_join(
+      hypercube_data_list[[1]] %>% 
+        mutate(risk = bads2/cnt2) %>% 
+        select(risk_drivers, risk),
+      by = risk_drivers
+    ) %>% 
+    group_by(split_gr) %>% 
+    summarise(risk = sum(sim_cnt * risk, na.rm = T) / sum(sim_cnt, na.rm = T)) %>% 
+    pull()
+}
+
+
+
+
+hist(risk_dots)
+
+
+fact_risk <- 
+  risk_data1 %>% 
+  filter(charged_mob == 24) %>% 
+  filter(issue_d >= '2013-01-01') %>% 
+  arrange(issue_d) %>% 
+  mutate(n = row_number() + 1) %>% 
+  filter(!is.na(risk)) %>% 
+  select(issue_d, risk)
+
+
+
+merge_data <- 
+
+sim_group_data <- 
+  split_reverse_data %>% 
+  
+  left_join(merge_data, by = risk_drivers)
