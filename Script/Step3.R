@@ -753,6 +753,7 @@ cop_dict2 <-
 
 
 for (i in 1:3) {
+  
   hypercube_history_df %>% 
     left_join(fact_risk %>% select(id, issue_d), by = c('date' = 'issue_d')) %>% 
     mutate_at("id", ~ coalesce(., 0L)) %>% 
@@ -779,7 +780,260 @@ for (i in 1:3) {
   
 }
 
+  
+fact_risk %>% 
+  arrange(id) %>% 
+  mutate(risk_diff = risk / lead(risk) - 1) %>% 
+  left_join(cop_params, by = "id") %>%
+  filter(cop == 1) %>% 
+  ggplot() +
+  geom_col(aes(x = id, y = risk_diff, fill = as.factor(fam)))
+ 
+hypercube_history_df %>% 
+  left_join(fact_risk %>% select(id, issue_d), by = c('date' = 'issue_d')) %>% 
+  arrange(id) %>% 
+  mutate(risk_diff = risk / lead(risk) - 1) %>% 
+  left_join(cop_params, by = "id") %>%
+  filter(cop == 1) %>%
+  ggplot() +
+  geom_violin(aes(x = as.factor(id), y = risk_diff, fill = as.factor(fam)), draw_quantiles = c(0.1, 0.25, 0.5, 0.75, 0.9)) +
+  ylim(-1,1)
+
+
+# Симуляция роста риска
+
+X_good <- raw_xtr_list[[1]] %>% filter(bads24 == 0) %>% select(risk_drivers)
+X_bad <- raw_xtr_list[[1]] %>% filter(bads24 == 1) %>% select(risk_drivers)
+
+U_good <- pobs(as.matrix(X_good))
+U_bad <- pobs(as.matrix(X_bad))
+
+# Оценка
+estimation <- map(list(U_good, U_bad), CDVineCopSelect, type = 2)
+  
+# Восстановление данных
+Xscenario <- round(NROW(X_bad) * seq(0.5, 3, 0.1))
+Ubad <- map(Xscenario, 
+    ~ CDVineSim(., 
+                family = estimation[[2]]$family, 
+                par = estimation[[2]]$par, 
+                par2 = estimation[[2]]$par2, 
+                type = 2))
+
+Ugood <- CDVineSim(NROW(X_good), 
+                   family = estimation[[1]]$family, 
+                   par = estimation[[1]]$par, 
+                   par2 = estimation[[1]]$par2, 
+                   type = 2)
+
+reverse_data_good <- 
+  map(1:NCOL(U_good), 
+      ~ approxfun(U_good[,.x], 
+                  X_good[,.x] %>% 
+                    pull())(Ugood[,.x])) %>% 
+  as.data.frame() %>% 
+  rename_all(~ risk_drivers)
+
+reverse_data_bad <- 
+  map(Ubad, 
+      function(num) {
+        map(1:NCOL(U_bad),
+            ~ approxfun(U_bad[,.x], X_bad[,.x] %>% pull())(num[,.x])) %>% 
+          as.data.frame() %>% 
+          rename_all(~ risk_drivers)
+      })
+
+samples <- map2(reverse_data_bad, 
+                list(reverse_data_good), 
+                ~ rbind(mutate(.x, bad = 1L), 
+                        mutate(.y, bad = 0L)))
+
+
+split_sampl <- map(samples, 
+                   ~ split_it(.x[, risk_drivers], breaks) %>% 
+                     mutate(bads = .x$bad) %>% 
+                     group_by(.dots = risk_drivers) %>% 
+                     summarise(cnt = n(), bads = sum(bads)) %>% 
+                     mutate(risk = bads / cnt))
+
+final_simulation <- map2_df(seq(0.5, 3, 0.1), split_sampl, ~ rbind(mutate(.y, Xscenario = .x))) %>% ungroup()
+
+
+
+
+
+raw_xtr_ready <- raw_xtr %>% filter(!is.na(bads24))
+
+fact_data <- 
+  cbind(issue_d = raw_xtr_ready$issue_d, 
+        raw_xtr_ready[,risk_drivers] %>% split_it(breaks), 
+        bads = raw_xtr_ready$bads24) %>% 
+  group_by(.dots = c("issue_d", risk_drivers)) %>% 
+  summarise(bads = sum(bads), cnt = n())
+
+fact_data_total <- 
+  fact_data %>% 
+  group_by(issue_d) %>% 
+  summarise(risk = sum(bads) / sum(cnt),
+            cnt = sum(cnt)) %>% 
+  ungroup()
+
+fact_data_total <- 
+  fact_data_total %>% 
+  mutate(risk_base = 
+           fact_data_total %>% 
+           filter(issue_d == '2013-01-01') %>% 
+           pull(risk)) %>% 
+  mutate(Xscenario = risk / risk_base)
+
+
+
+sim_data_for_ggplot <- 
+  final_simulation %>% 
+  filter_at(risk_drivers, ~ !is.na(.)) %>% 
+  left_join(filter(final_simulation, Xscenario == 1), 
+            by = risk_drivers, 
+            suffix = c("", "_base")) %>% 
+  group_by(Xscenario) %>% 
+  mutate(cnt_part = cnt / sum(cnt),
+         cnt_part_base = cnt_base / sum(cnt_base)) %>% 
+  ungroup() %>% 
+  group_by(.dots = c("Xscenario", risk_drivers)) %>% 
+  summarise(risk = sum(bads) / sum(cnt), 
+            cnt = sum(cnt),
+            cnt_part = sum(cnt_part, na.rm = T),
+            risk_base = sum(bads_base, na.rm = T) / sum(cnt_base, na.rm = T),
+            cnt_base = sum(cnt_base, na.rm = T),
+            cnt_part_base = sum(cnt_part_base, na.rm = T)
+  ) %>% 
+  ungroup() %>% 
+  mutate(change_risk = risk / risk_base,
+         change_cnt = cnt_part / cnt_part_base)
+
+fact_data_x <-
+  fact_data %>% 
+  left_join(fact_data_total %>% 
+              select(issue_d, Xscenario), 
+            by = "issue_d") %>%
+  left_join(fact_data %>% 
+              filter(issue_d == '2013-01-01'), 
+            by = risk_drivers, 
+            suffix = c("", "_base")) %>% 
+  
+  mutate(Xscenario = cut(Xscenario,
+                          breaks = c(-Inf, 0.9999, 1, 1.2, 1.3, +Inf),
+                          labels = c(0.9, 1, 1.2, 1.3, 1.5)) %>%
+           as.character() %>%
+           as.numeric()) %>%
+  
+  group_by(Xscenario) %>% 
+  mutate(cnt_part = cnt / sum(cnt),
+         cnt_part_base = cnt_base / sum(cnt_base)) %>% 
+  ungroup() %>% 
+  
+  group_by(.dots = c("Xscenario", risk_drivers)) %>% 
+  summarise(risk = sum(bads) / sum(cnt), 
+            cnt = sum(cnt),
+            cnt_part = sum(cnt_part),
+            risk_base = sum(bads_base, na.rm = T) / sum(cnt_base, na.rm = T),
+            cnt_base = sum(cnt_base, na.rm = T),
+            cnt_part_base = sum(cnt_part_base)) %>% 
+  ungroup() %>% 
+  mutate(change_risk = risk / risk_base,
+         change_cnt = cnt_part / cnt_part_base)
 
 
   
+
+# Фактические данные
   
+fact_data_x %>%  
+  mutate(risk_label = 
+           ifelse(round(change_risk, 2) == 1 | is.infinite(change_risk) | is.nan(change_risk),
+                  NA,
+                  paste0("X", round(change_risk, 1)))) %>% 
+  
+  ggplot(aes(x = int_rate, y = dti)) +
+  geom_raster(aes(fill = risk, alpha = cnt_part^0.01)) +
+  scale_fill_viridis_c(option = "plasma") +
+  geom_text(aes(label = risk_label)) + 
+  facet_grid(Xscenario + . ~ annual_inc, labeller = label_both) +
+  scale_alpha(guide = 'none') +
+  labs(fill = "risk level")
+
+ggsave("./Output/lendin_club_fact_Xscenario.png", width = 16, height = 12, dpi = 500)
+
+
+# Симуляция
+
+sim_data_for_ggplot %>% 
+  filter(Xscenario %in% c(0.9, 1, 1.2, 1.3, 1.5)) %>% 
+  mutate(risk_label = 
+           ifelse(round(change_risk, 2) == 1 | is.infinite(change_risk) | is.nan(change_risk),
+                  NA,
+                  paste0("X", round(change_risk, 1)))) %>% 
+  
+  inner_join(fact_data_x, by = c(risk_drivers, "Xscenario"), suffix = c("", "_fact")) %>% 
+  mutate(risk_diff = change_risk / change_risk_fact - 1) %>% 
+  mutate(risk_diff2 = ifelse(is.na(risk_label), NA, pmin(2,risk_diff))) %>%
+  
+  ggplot(aes(x = int_rate, y = dti)) +
+  geom_raster(aes(fill = risk, alpha = cnt_part^0.01)) +
+  scale_fill_viridis_c(option = "plasma") +
+  
+  geom_point(aes(color = risk_diff2), size = 9.5) +
+  scale_colour_gradient2(low = "blue",
+                         mid = "white",
+                         high = "red",
+                         na.value = NA) +
+  
+  geom_text(aes(x = int_rate, y = dti, label = risk_label)) + 
+  
+  facet_grid(Xscenario + . ~ annual_inc, labeller = label_both) +
+  scale_alpha(guide = 'none') +
+  labs(fill = "risk level", color = "error level")  
+
+ggsave("./Output/lendin_club_sim_Xscenario.png", width = 16, height = 12, dpi = 500)
+
+for (i in 1:3) {
+  for (j in 1:2) {
+    
+    predictor <- risk_drivers[i]
+    type_plot <- c("change_part", "change_risk")[j]
+    
+    sim_data_for_ggplot %>% 
+      group_by(.dots = c('Xscenario', predictor)) %>% 
+      summarise(risk = sum(risk * cnt) / sum(cnt), 
+                cnt = sum(cnt),
+                cnt_part = sum(cnt_part),
+                risk_base = sum(risk_base * cnt_base, na.rm = T) / sum(cnt_base, na.rm = T),
+                cnt_base = sum(cnt_base, na.rm = T),
+                cnt_part_base = sum(cnt_part_base)) %>% 
+      ungroup() %>% 
+      mutate(change_risk = risk / risk_base,
+             change_part = cnt_part / cnt_part_base) %>%
+      mutate_at(predictor, as.factor) %>% 
+      ggplot() +
+      geom_line(aes_string(x = "Xscenario", y = type_plot, color = predictor), alpha = 0.7,  linetype = 2) +
+      geom_line(data = 
+                  fact_data_x %>% 
+                  filter(Xscenario >= 1) %>% 
+                  group_by(.dots = c('Xscenario', predictor)) %>% 
+                  summarise(risk = sum(risk * cnt) / sum(cnt), 
+                            cnt = sum(cnt),
+                            cnt_part = sum(cnt_part),
+                            risk_base = sum(risk_base * cnt_base, na.rm = T) / sum(cnt_base, na.rm = T),
+                            cnt_base = sum(cnt_base, na.rm = T),
+                            cnt_part_base = sum(cnt_part_base)) %>% 
+                  ungroup() %>% 
+                  mutate_at(predictor, as.factor) %>% 
+                  mutate(change_risk = risk / risk_base,
+                         change_part = cnt_part / cnt_part_base),
+                aes_string(x = "Xscenario", y = type_plot, color = predictor)) +
+      labs(color = predictor)
+    
+    ggsave(paste0("./Output/lendin_club_sim_vs_fact_", predictor,"_", type_plot ,".png"), width = 5, height = 4)
+    
+  } 
+}
+
